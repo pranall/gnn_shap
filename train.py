@@ -36,7 +36,7 @@ def explain_gnn_with_shap(gnn_model, data_loader, device, sample_count=10):
     
     # SHAP expects background samples: use a small batch as background
     background = [graph_batch[i] for i in range(min(5, len(graph_batch)))]
-    explainer = shap.DeepExplainer(gnn_model, background)
+    explainer = shap.GradientExplainer(gnn_model, background)
     shap_values = explainer.shap_values(graph_batch)
     return shap_values, graph_batch
 
