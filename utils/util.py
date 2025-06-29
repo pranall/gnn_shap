@@ -152,6 +152,13 @@ def get_args():
     parser.add_argument('--output', type=str, default="train_output")
     parser.add_argument('--weight_decay', type=float, default=5e-4)
     parser.add_argument('--use_gnn', type=int, default=0, help="Enable GNN feature extractor if 1")
+    parser.add_argument('--use_gnn', type=int, default=0, help='Enable GNN feature extractor (1) or not (0)')
+    parser.add_argument('--use_shap', type=int, default=0, help='Enable SHAP analysis after training (1) or not (0)')
+    parser.add_argument('--in_channels', type=int, default=8, help='Number of input channels (features/sensors)')
+    parser.add_argument('--hidden_dim', type=int, default=32, help='Hidden dimension for GNN')
+    parser.add_argument('--num_layers', type=int, default=2, help='Number of GNN layers')
+    parser.add_argument('--lstm_hidden', type=int, default=64, help='LSTM hidden dimension in GNN')
+    parser.add_argument('--output_dim', type=int, default=6, help='Output dimension for classifier')
     args = parser.parse_args()
     args.steps_per_epoch = 10000000000
     args.data_dir = args.data_file+args.data_dir
