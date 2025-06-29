@@ -10,23 +10,57 @@ import argparse
 
 # Define the argument parser
 def parse_args():
-    parser = argparse.ArgumentParser(description="Train and validate GNN with SHAP")
+    parser = argparse.ArgumentParser(description="Train Diversify+GNN with optional SHAP")
 
-    # Add the arguments that you'll need (you can modify these based on your needs)
-    parser.add_argument('--lr', type=float, default=0.001, help="Learning rate")
-    parser.add_argument('--max_epoch', type=int, default=10, help="Number of training epochs")
-    parser.add_argument('--batch_size', type=int, default=32, help="Batch size")
-    parser.add_argument('--use_shap', type=int, default=1, choices=[0, 1], help="Whether to use SHAP (1: yes, 0: no)")
-    parser.add_argument('--shap_freq', type=int, default=1, help="Frequency of SHAP explanation generation (epochs)")
-    parser.add_argument('--in_channels', type=int, default=8, help="Number of input channels")
-    parser.add_argument('--hidden_dim', type=int, default=64, help="Hidden dimension of GNN")
-    parser.add_argument('--num_layers', type=int, default=2, help="Number of GNN layers")
-    parser.add_argument('--lstm_hidden', type=int, default=64, help="LSTM hidden dimension")
-    parser.add_argument('--output_dim', type=int, default=6, help="Output dimension")
-    parser.add_argument('--device', type=str, default='cuda', choices=['cpu', 'cuda'], help="Device to run the model on")
+    # Diversify / dataset flags
+    parser.add_argument('--dataset',           type=str,   default='emg',
+                        help="Which dataset to run (e.g. emg, dsads)")
+    parser.add_argument('--data_dir',          type=str,   default='./data/',
+                        help="Path to your ./data/ folder")
+    parser.add_argument('--test_envs',         type=int,   nargs='+', default=[0],
+                        help="Which environment(s) to hold out as test")
+    parser.add_argument('--algorithm',         type=str,   default='diversify',
+                        help="Domain generalization algorithm")
+    parser.add_argument('--use_gnn',           type=int,   choices=[0,1], default=1,
+                        help="1 to enable GNN, 0 to disable")
+    parser.add_argument('--latent_domain_num', type=int,   default=5,
+                        help="Number of latent domains")
+    parser.add_argument('--alpha1',            type=float, default=1.0,
+                        help="Diversify hyperparam α1")
+    parser.add_argument('--alpha',             type=float, default=10.0,
+                        help="Diversify hyperparam α")
+    parser.add_argument('--lam',               type=float, default=0.0,
+                        help="Diversify hyperparam λ")
+    parser.add_argument('--local_epoch',       type=int,   default=2,
+                        help="Local adaptation epochs")
 
-    # Parse the arguments
-    args = parser.parse_args()
+    # Model / training flags
+    parser.add_argument('--in_channels',       type=int,   default=8,
+                        help="Number of input channels")
+    parser.add_argument('--hidden_dim',        type=int,   default=64,
+                        help="Hidden dimension of GNN")
+    parser.add_argument('--num_layers',        type=int,   default=2,
+                        help="Number of GCN layers")
+    parser.add_argument('--lstm_hidden',       type=int,   default=64,
+                        help="Hidden size of LSTM")
+    parser.add_argument('--output_dim',        type=int,   default=6,
+                        help="Number of classes / output dim")
+    parser.add_argument('--lr',                type=float, default=0.01,
+                        help="Learning rate")
+    parser.add_argument('--weight_decay',      type=float, default=0.0005,
+                        help="Weight decay")
+    parser.add_argument('--batch_size',        type=int,   default=32,
+                        help="Batch size")
+    parser.add_argument('--max_epoch',         type=int,   default=1,
+                        help="Number of epochs")
+    parser.add_argument('--device',            type=str,   choices=['cpu','cuda'], default='cuda',
+                        help="Device to train on")
+
+    # SHAP flags
+    parser.add_argument('--use_shap',          type=int, choices=[0,1], default=1,
+                        help="1 to run SHAP during validation")
+    parser.add_argument('--shap_freq',         type=int, default=1,
+                        help="Run SHAP every N epochs")
 
     return args
 
