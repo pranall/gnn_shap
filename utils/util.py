@@ -1,7 +1,6 @@
 # Copyright (c) Microsoft Corporation.
 # Licensed under the MIT License.
 
-
 import random
 import numpy as np
 import torch
@@ -11,7 +10,6 @@ import argparse
 import torchvision
 import PIL
 
-
 def set_random_seed(seed=0):
     random.seed(seed)
     np.random.seed(seed)
@@ -19,7 +17,6 @@ def set_random_seed(seed=0):
     torch.cuda.manual_seed(seed)
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
-
 
 def train_valid_target_eval_names(args):
     eval_name_dict = {'train': [], 'valid': [], 'target': []}
@@ -31,11 +28,9 @@ def train_valid_target_eval_names(args):
             eval_name_dict['target'].append('eval%d_out' % i)
     return eval_name_dict
 
-
 def alg_loss_dict(args):
     loss_dict = {'diversify': ['class', 'dis', 'total']}
     return loss_dict[args.algorithm]
-
 
 def print_args(args, print_list):
     s = "==========================================\n"
@@ -44,7 +39,6 @@ def print_args(args, print_list):
         if l == 0 or arg in print_list:
             s += "{}:{}\n".format(arg, content)
     return s
-
 
 def print_row(row, colwidth=10, latex=False):
     if latex:
@@ -60,7 +54,6 @@ def print_row(row, colwidth=10, latex=False):
         return str(x).ljust(colwidth)[:colwidth]
     print(sep.join([format_val(x) for x in row]), end_)
 
-
 def print_environ():
     print("Environment:")
     print("\tPython: {}".format(sys.version.split(" ")[0]))
@@ -70,7 +63,6 @@ def print_environ():
     print("\tCUDNN: {}".format(torch.backends.cudnn.version()))
     print("\tNumPy: {}".format(np.__version__))
     print("\tPIL: {}".format(PIL.__version__))
-
 
 class Tee:
     def __init__(self, fname, mode="a"):
@@ -85,7 +77,6 @@ class Tee:
     def flush(self):
         self.stdout.flush()
         self.file.flush()
-
 
 def act_param_init(args):
     args.select_position = {'emg': [0], 'dsads': [0]}
@@ -107,7 +98,6 @@ def act_param_init(args):
         )
     args.input_shape, args.num_classes, args.grid_size = tmp[args.dataset]
     return args
-
 
 def get_args():
     parser = argparse.ArgumentParser(description='DG')
@@ -151,8 +141,8 @@ def get_args():
     parser.add_argument('--test_envs', type=int, nargs='+', default=[0])
     parser.add_argument('--output', type=str, default="train_output")
     parser.add_argument('--weight_decay', type=float, default=5e-4)
+    # ==== GNN/SHAP only ONCE each ====
     parser.add_argument('--use_gnn', type=int, default=0, help="Enable GNN feature extractor if 1")
-    parser.add_argument('--use_gnn', type=int, default=0, help='Enable GNN feature extractor (1) or not (0)')
     parser.add_argument('--use_shap', type=int, default=0, help='Enable SHAP analysis after training (1) or not (0)')
     parser.add_argument('--in_channels', type=int, default=8, help='Number of input channels (features/sensors)')
     parser.add_argument('--hidden_dim', type=int, default=32, help='Hidden dimension for GNN')
