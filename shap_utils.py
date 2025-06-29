@@ -18,8 +18,7 @@ def explain_gnn_with_shap(model, data_loader, device, sample_count=10):
     batch_data = batch_data.to(device)
     background = batch_data
     wrapped_model = GNNWrapper(model)
-    # ------ wrap background in a tuple ------
+    # THIS IS THE KEY LINE: pass (background,) as tuple
     explainer = shap.GradientExplainer(wrapped_model, (background,))
-    # ------ wrap batch_data in a tuple ------
     shap_values = explainer.shap_values((batch_data,))
     return shap_values, batch_data
