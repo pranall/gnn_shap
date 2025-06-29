@@ -12,6 +12,7 @@ import torch.nn as nn
 # === GNN imports ===
 from models.gnn_extractor import TemporalGCN, build_correlation_graph
 from diversify.utils.params import gnn_params
+from shap_utils import GNNWrapper, explain_gnn_with_shap
 
 # === SHAP imports ===
 import shap
