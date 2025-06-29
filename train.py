@@ -5,10 +5,8 @@ import torch.nn.functional as F
 import numpy as np
 import shap
 
-from torch.utils.data import DataLoader
 from torch_geometric.data import Data, Batch
 from torch_geometric.nn import GCNConv, global_mean_pool, BatchNorm
-
 from datautil.getdataloader_single import get_act_dataloader
 
 # -----------------------------------------------------------------------------
@@ -62,25 +60,22 @@ def create_data_loaders(args):
         'emg':   [list(range(0,9)), list(range(9,18)), list(range(18,27)), list(range(27,36))],
         'dsads':[list(range(i*8, i*8+8)) for i in range(8)]
     }
-    # get_act_dataloader returns 7 items; we only need train & valid
     train_loader, _, valid_loader, _, _, _, _ = get_act_dataloader(args)
     return train_loader, valid_loader
 
 # -----------------------------------------------------------------------------
-# Batch → Graph conversion
+# Graph construction
 # -----------------------------------------------------------------------------
 def build_correlation_graph(batch_time_series, threshold=0.3, self_loops=True,
                             max_edges_per_node=None, device='cpu'):
-    # Handle extra dims e.g. (B,C,1,T)
     if batch_time_series.dim() == 4:
         batch_time_series = batch_time_series.squeeze(2)
     B, C, T = batch_time_series.shape
     data_list = []
 
     for i in range(B):
-        # x: [C, T] → transpose to [T, C]
         x_ts = batch_time_series[i].t().float()
-        corr = torch.corrcoef(x_ts.T).abs()  # [C, C]
+        corr = torch.corrcoef(x_ts.T).abs()
         edge_index = (corr > threshold).nonzero(as_tuple=False).T.to(device)
 
         if not self_loops:
@@ -98,28 +93,30 @@ def build_correlation_graph(batch_time_series, threshold=0.3, self_loops=True,
             if topk_edges:
                 edge_index = torch.tensor(topk_edges, dtype=torch.long).T.to(device)
 
-        # Node features: mean over time, repeated to shape [C, C]
         feat = x_ts.mean(dim=0).unsqueeze(0).repeat(C, 1).to(device)
         data_list.append(Data(x=feat, edge_index=edge_index))
 
     return data_list
 
+# -----------------------------------------------------------------------------
+# **FIXED**: batch → PyG Batch with correct dtypes
+# -----------------------------------------------------------------------------
 def batch_to_graph(batch, device):
-    # Loader yields tuple/list: (x, y, ...)
+    # Expect batch as (x_ts, y, …)
     if isinstance(batch, (list, tuple)):
         x_ts, y = batch[0], batch[1]
     else:
-        raise ValueError("Expected batch as tuple/list (x, y, ...).")
+        raise ValueError("Expected batch as tuple/list")
 
-    # Move label tensor to device
-    y = y.to(device)
+    # Move and cast target to LongTensor on device
+    y = y.to(device).long()
 
-    # Build PyG Data list
-    graph_list = build_correlation_graph(x_ts, device=device)
-    for g, label in zip(graph_list, y):
-        g.y = label
+    # Build graph list
+    graphs = build_correlation_graph(x_ts, device=device)
+    for g, label in zip(graphs, y):
+        g.y = label  # now a LongTensor
 
-    return Batch.from_data_list(graph_list)
+    return Batch.from_data_list(graphs)
 
 # -----------------------------------------------------------------------------
 # Model definitions
@@ -140,18 +137,17 @@ class TemporalGCN(nn.Module):
         self.dropout = nn.Dropout(dropout)
 
     def forward(self, data: Data):
-        x = data.x.float()             # ensure float32
+        x = data.x.float()  # ensure float32
         ei = data.edge_index
         b  = data.batch
 
         for gcn, norm in zip(self.gcn_layers, self.norms):
             x = F.relu(self.dropout(norm(gcn(x, ei))))
 
-        pooled = global_mean_pool(x, b)     # [B, hidden_dim]
-        seq    = pooled.unsqueeze(1)        # [B, 1, hidden_dim]
-        _, (hn, _) = self.lstm(seq)         # hn: [1, B, lstm_hidden]
-        return self.out(hn[-1])             # [B, output_dim]
-
+        pooled = global_mean_pool(x, b)
+        seq    = pooled.unsqueeze(1)
+        _, (hn, _) = self.lstm(seq)
+        return self.out(hn[-1])
 
 class GNNExplainerWrapper(nn.Module):
     """Wraps TemporalGCN for SHAP: flattens & rebuilds graphs."""
@@ -162,9 +158,8 @@ class GNNExplainerWrapper(nn.Module):
 
     def forward(self, flat_arrays):
         device = next(self.model.parameters()).device
-        shape  = self.sample.x.shape   # (num_nodes, feat_dim)
+        shape  = self.sample.x.shape
         data_list = []
-
         for arr in flat_arrays:
             x = torch.tensor(arr, dtype=torch.float32, device=device).reshape(shape)
             data_list.append(Data(
@@ -178,31 +173,22 @@ class GNNExplainerWrapper(nn.Module):
 # SHAP & validation
 # -----------------------------------------------------------------------------
 def visualize_shap_values(shap_vals, data):
-    # TODO: insert your matplotlib / saving logic here
+    # TODO: your plotting/saving code here
     pass
 
 def explain_gnn_with_shap(model, valid_loader, device, sample_count=5, nsamples=50):
     model.eval()
-    raw_batch = next(iter(valid_loader))
-    if isinstance(raw_batch, (list, tuple)):
-        raw_batch = raw_batch  # keep tuple for batch_to_graph
-    else:
-        raise ValueError("Expected raw_batch as tuple/list")
-
-    # We'll explain the first sample in batch
-    graph_batch = batch_to_graph(raw_batch, device)
-    data_list   = graph_batch.to_data_list()
-    anchor      = data_list[0]
+    raw = next(iter(valid_loader))
+    g   = batch_to_graph(raw, device)
+    data_list = g.to_data_list()
+    anchor    = data_list[0]
 
     wrapper = GNNExplainerWrapper(model, anchor).to(device)
-    background = np.stack([d.x.cpu().numpy().flatten()
-                           for d in data_list[:sample_count]], axis=0)
+    bg = np.stack([d.x.cpu().numpy().flatten() for d in data_list[:sample_count]], axis=0)
 
-    explainer = shap.KernelExplainer(wrapper, background, keep_index=True)
-    target    = anchor.x.cpu().numpy().flatten()[None, :]
-    shap_vals = explainer.shap_values(target, nsamples=nsamples)
-
-    # reshape back to node-feature grid
+    explainer = shap.KernelExplainer(wrapper, bg, keep_index=True)
+    tgt       = anchor.x.cpu().numpy().flatten()[None, :]
+    shap_vals = explainer.shap_values(tgt, nsamples=nsamples)
     return shap_vals[0].reshape(anchor.x.shape), anchor
 
 def validate(args, model, valid_loader, epoch):
@@ -211,8 +197,8 @@ def validate(args, model, valid_loader, epoch):
     total, correct, loss_sum = 0, 0, 0.0
 
     with torch.no_grad():
-        for raw_batch in valid_loader:
-            g = batch_to_graph(raw_batch, args.device)
+        for raw in valid_loader:
+            g   = batch_to_graph(raw, args.device)
             out = model(g)
             loss_sum += crit(out, g.y).item()
             preds = out.argmax(dim=1)
@@ -222,7 +208,7 @@ def validate(args, model, valid_loader, epoch):
     acc = 100 * correct / total
     print(f"[Val] Epoch {epoch} — Acc {acc:.2f}%  Loss {loss_sum/len(valid_loader):.4f}")
 
-    if args.use_shap and (epoch % args.shap_freq) == 0:
+    if args.use_shap and epoch % args.shap_freq == 0:
         print("[SHAP] computing explanations…")
         shap_vals, anchor = explain_gnn_with_shap(model, valid_loader, args.device)
         print(f"[SHAP] values shape: {shap_vals.shape}")
@@ -242,11 +228,11 @@ def train(args, model, train_loader, valid_loader):
         run_loss = 0.0
         crit     = nn.CrossEntropyLoss()
 
-        for raw_batch in train_loader:
-            g = batch_to_graph(raw_batch, args.device)
+        for raw in train_loader:
+            g   = batch_to_graph(raw, args.device)
             opt.zero_grad()
             out = model(g)
-            loss = crit(out, g.y)
+            loss= crit(out, g.y)
             loss.backward()
             opt.step()
             run_loss += loss.item()
