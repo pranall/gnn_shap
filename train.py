@@ -12,34 +12,45 @@ import torch.nn as nn
 # === GNN imports ===
 from models.gnn_extractor import TemporalGCN, build_correlation_graph
 from diversify.utils.params import gnn_params
-from shap_utils import GNNWrapper, explain_gnn_with_shap
+from shap_utils import GNNWrapper
 
 # === SHAP imports ===
 import shap
 import numpy as np
 import matplotlib.pyplot as plt
+from torch_geometric.data import Batch
 
-def explain_gnn_with_shap(gnn_model, data_loader, device, sample_count=10):
+def explain_gnn_with_shap(gnn_model, data_loader, device, sample_count=5):
     gnn_model.eval()
     # Sample a batch from the loader
     batch = next(iter(data_loader))
-    batch_x = batch[0] if isinstance(batch, (list, tuple)) else batch
-    if len(batch_x.shape) == 4 and batch_x.shape[2] == 1:
-        batch_x = batch_x.squeeze(2)
-    batch_x = batch_x[:sample_count]
-    gnn_graphs = build_correlation_graph(batch_x.to(device))
-    from torch_geometric.loader import DataLoader as GeoDataLoader
-    geo_loader = GeoDataLoader(gnn_graphs, batch_size=len(gnn_graphs))
-    graph_batch = next(iter(geo_loader)).to(device)
+    if isinstance(batch, (list, tuple)):
+        batch = batch[0]
+    batch = batch.to(device)
+    # Use .to_data_list() for a list of Data objects
+    if hasattr(batch, "to_data_list"):
+        data_list = batch.to_data_list()
+    else:
+        data_list = batch
+    # Use a few graphs for background and explanation (KernelExplainer is slow)
+    background = data_list[:sample_count]
+    test_samples = data_list[:sample_count]
 
-    def gnn_forward(graphs):
-        return gnn_model(graphs).detach().cpu().numpy()
-    
-    # SHAP expects background samples: use a small batch as background
-    background = [graph_batch[i] for i in range(min(5, len(graph_batch)))]
     wrapped_model = GNNWrapper(gnn_model)
-    explainer = shap.GradientExplainer(wrapped_model, (background,))
-    shap_values = explainer.shap_values(graph_batch)
+
+    def gnn_predict(batch_list):
+        # Accepts a list of Data objects, returns model output
+        batched = Batch.from_data_list(batch_list).to(device)
+        out = wrapped_model(batched)
+        if isinstance(out, torch.Tensor):
+            out = out.detach().cpu().numpy()
+        return out
+
+    # KernelExplainer expects a callable and a list of background graphs
+    explainer = shap.KernelExplainer(gnn_predict, background)
+    shap_values = explainer.shap_values(test_samples)
+    # For visualization, create a Batch for the test samples
+    graph_batch = Batch.from_data_list(test_samples)
     return shap_values, graph_batch
 
 def plot_shap_summary(shap_values, graph_batch, feature_names=None):
