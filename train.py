@@ -8,6 +8,8 @@ import shap
 from torch_geometric.data import Data, Batch
 from torch_geometric.nn import GCNConv, global_mean_pool, BatchNorm
 from datautil.getdataloader_single import get_act_dataloader
+import warnings
+warnings.filterwarnings("ignore")
 
 # -----------------------------------------------------------------------------
 # Argument parsing
@@ -245,9 +247,9 @@ def validate(args, model, valid_loader, epoch):
     print(f"[Val] Epoch {epoch} — Acc {acc:.2f}%  Loss {loss_sum/len(valid_loader):.4f}")
 
     if args.use_shap and epoch % args.shap_freq == 0:
-        print("[SHAP] computing explanations…")
+        #print("[SHAP] computing explanations…")
         shap_vals, anchor = explain_gnn_with_shap(model, valid_loader, args.device)
-        print(f"[SHAP] values shape: {shap_vals.shape}")
+        #print(f"[SHAP] values shape: {shap_vals.shape}")
         visualize_shap_values(shap_vals, anchor)
 
     return acc
