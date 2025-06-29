@@ -8,6 +8,29 @@ import shap
 from tqdm import tqdm
 import argparse
 
+# Define the argument parser
+def parse_args():
+    parser = argparse.ArgumentParser(description="Train and validate GNN with SHAP")
+
+    # Add the arguments that you'll need (you can modify these based on your needs)
+    parser.add_argument('--lr', type=float, default=0.001, help="Learning rate")
+    parser.add_argument('--max_epoch', type=int, default=10, help="Number of training epochs")
+    parser.add_argument('--batch_size', type=int, default=32, help="Batch size")
+    parser.add_argument('--use_shap', type=int, default=1, choices=[0, 1], help="Whether to use SHAP (1: yes, 0: no)")
+    parser.add_argument('--shap_freq', type=int, default=1, help="Frequency of SHAP explanation generation (epochs)")
+    parser.add_argument('--in_channels', type=int, default=8, help="Number of input channels")
+    parser.add_argument('--hidden_dim', type=int, default=64, help="Hidden dimension of GNN")
+    parser.add_argument('--num_layers', type=int, default=2, help="Number of GNN layers")
+    parser.add_argument('--lstm_hidden', type=int, default=64, help="LSTM hidden dimension")
+    parser.add_argument('--output_dim', type=int, default=6, help="Output dimension")
+    parser.add_argument('--device', type=str, default='cuda', choices=['cpu', 'cuda'], help="Device to run the model on")
+
+    # Parse the arguments
+    args = parser.parse_args()
+
+    return args
+
+
 class TemporalGCN(nn.Module):
     def __init__(self, in_channels, hidden_dim, num_layers, lstm_hidden, output_dim, dropout=0.2):
         super(TemporalGCN, self).__init__()
@@ -36,6 +59,7 @@ class TemporalGCN(nn.Module):
         hn = hn[-1]
         out = self.out(hn)
         return out
+
 
 class GNNExplainerWrapper(nn.Module):
     """Wrapper for SHAP explanations that preserves graph structure"""
@@ -74,6 +98,7 @@ class GNNExplainerWrapper(nn.Module):
             
         batch = Batch.from_data_list(data_list)
         return self.model(batch)
+
 
 def build_correlation_graph(batch_time_series, threshold=0.3, self_loops=True, max_edges_per_node=None, device='cpu'):
     """
@@ -117,6 +142,7 @@ def build_correlation_graph(batch_time_series, threshold=0.3, self_loops=True, m
     
     return data_list
 
+
 def validate(args, model, valid_loader, epoch):
     model.eval()
     total_loss = 0
@@ -155,6 +181,7 @@ def validate(args, model, valid_loader, epoch):
     
     return accuracy
 
+
 def train(args, model, train_loader, valid_loader):
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
     criterion = nn.CrossEntropyLoss()
@@ -182,6 +209,7 @@ def train(args, model, train_loader, valid_loader):
             best_acc = val_acc
             torch.save(model.state_dict(), 'best_model.pth')
 
+
 def main(args):
     # Initialize model
     model = TemporalGCN(
@@ -192,13 +220,14 @@ def main(args):
         output_dim=args.output_dim
     ).to(args.device)
     
-    # Training
+    # Run training
     train(args, model, train_loader, valid_loader)
     
     return model
 
+
 if __name__ == "__main__":
-    # Parse arguments (you'll need to implement this)
+    # Parse arguments
     args = parse_args()
     
     # Create data loaders (you'll need to implement this)
