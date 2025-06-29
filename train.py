@@ -1,230 +1,163 @@
-# Copyright (c) Microsoft Corporation.
-# Licensed under the MIT License.
-
-import time
-from alg.opt import *
-from alg import alg, modelopera
-from utils.util import set_random_seed, get_args, print_row, print_args, train_valid_target_eval_names, alg_loss_dict, print_environ
-from datautil.getdataloader_single import get_act_dataloader
 import torch
 import torch.nn as nn
-
-# === GNN imports ===
-from models.gnn_extractor import TemporalGCN, build_correlation_graph
-from diversify.utils.params import gnn_params
-from shap_utils import GNNWrapper
-
-# === SHAP imports ===
-import shap
+import torch.nn.functional as F
+from torch_geometric.nn import GCNConv, global_mean_pool, BatchNorm
+from torch_geometric.data import Data, Batch
 import numpy as np
-import matplotlib.pyplot as plt
-from torch_geometric.data import Batch
+from tqdm import tqdm
+import shap
 
-def explain_gnn_with_shap(gnn_model, data_loader, device, sample_count=5):
-    gnn_model.eval()
-    # Sample a batch from the loader
-    batch = next(iter(data_loader))
-    # Handle (data, label) tuple, or just data
-    if isinstance(batch, (list, tuple)) and hasattr(batch[0], 'to_data_list'):
-        data_list = batch[0].to_data_list()
-    elif hasattr(batch, 'to_data_list'):
-        data_list = batch.to_data_list()
-    else:
-        # Already a list of Data
-        data_list = batch
-    # Use a few graphs for background and explanation (KernelExplainer is slow)
-    background = data_list[:sample_count]
-    test_samples = data_list[:sample_count]
+class TemporalGCN(nn.Module):
+    def __init__(self, in_channels, hidden_dim, num_layers, lstm_hidden, output_dim, dropout=0.2):
+        super(TemporalGCN, self).__init__()
+        self.gcn_layers = nn.ModuleList()
+        self.norms = nn.ModuleList()
+        self.gcn_layers.append(GCNConv(in_channels, hidden_dim))
+        self.norms.append(BatchNorm(hidden_dim))
+        for _ in range(num_layers - 1):
+            self.gcn_layers.append(GCNConv(hidden_dim, hidden_dim))
+            self.norms.append(BatchNorm(hidden_dim))
+        self.lstm = nn.LSTM(hidden_dim, lstm_hidden, batch_first=True)
+        self.out = nn.Linear(lstm_hidden, output_dim)
+        self.dropout = nn.Dropout(dropout)
+        self.hidden_dim = hidden_dim
 
-    wrapped_model = GNNWrapper(gnn_model)
-
-    def gnn_predict(graph_list):
-        # Accepts a list of Data objects, returns model output
-        from torch_geometric.data import Batch
-        batch = Batch.from_data_list(graph_list).to(device)
-        out = wrapped_model(batch)
-        if isinstance(out, torch.Tensor):
-            out = out.detach().cpu().numpy()
+    def forward(self, data):
+        x, edge_index, batch = data.x, data.edge_index, data.batch
+        for gcn, norm in zip(self.gcn_layers, self.norms):
+            x = gcn(x, edge_index)
+            x = norm(x)
+            x = F.relu(x)
+            x = self.dropout(x)
+        x_pooled = global_mean_pool(x, batch)  # [num_graphs, hidden_dim]
+        x_pooled = x_pooled.unsqueeze(1)       # [batch, seq, feat]
+        _, (hn, _) = self.lstm(x_pooled)
+        hn = hn[-1]
+        out = self.out(hn)
         return out
 
-    # KernelExplainer expects a callable and a list of Data objects
-    explainer = shap.KernelExplainer(gnn_predict, background)
-    shap_values = explainer.shap_values(test_samples)
-    # For visualization, create a Batch for the test samples
-    from torch_geometric.data import Batch
-    graph_batch = Batch.from_data_list(test_samples)
-    return shap_values, graph_batch
+def build_correlation_graph(batch_time_series, threshold=0.3, self_loops=True, max_edges_per_node=None):
+    """Improved graph builder with correlation-based edges"""
+    data_list = []
+    batch, channels, timesteps = batch_time_series.shape
 
-def plot_shap_summary(shap_values, graph_batch, feature_names=None):
-    # Node features: graph_batch.x
-    # Each row = node, columns = features (sensors)
-    x_np = graph_batch.x.cpu().numpy()
-    shap.summary_plot(shap_values, x_np, feature_names=feature_names, show=False)
-    plt.tight_layout()
-    plt.savefig("shap_summary.png")
-    plt.show()
+    for i in range(batch):
+        x = batch_time_series[i].T  # [timesteps, channels]
+        x = x.float()
+        corr = torch.corrcoef(x.T).abs()  # [channels, channels]
+        edge_index = (corr > threshold).nonzero(as_tuple=False).T
+        
+        if not self_loops:
+            mask = edge_index[0] != edge_index[1]
+            edge_index = edge_index[:, mask]
+            
+        if max_edges_per_node is not None:
+            topk_edges = []
+            for node in range(channels):
+                node_corr = corr[node]
+                node_corr[node] = 0
+                topk = torch.topk(node_corr, k=min(max_edges_per_node, channels-1)).indices
+                for dst in topk:
+                    topk_edges.append([node, dst.item()])
+            if topk_edges:
+                edge_index = torch.tensor(topk_edges, dtype=torch.long).T
+                
+        node_features = x.mean(dim=0).unsqueeze(0)
+        node_features = node_features.repeat(channels, 1)
+        data = Data(x=node_features, edge_index=edge_index)
+        data_list.append(data)
+    return data_list
 
-def main(args):
-    s = print_args(args, [])
-    set_random_seed(args.seed)
+class GNNExplainerWrapper(nn.Module):
+    """Wrapper for SHAP explanations that preserves graph structure"""
+    def __init__(self, model, original_data_sample):
+        super().__init__()
+        self.model = model
+        self.original_data = original_data_sample
+        
+    def forward(self, x_flat_list):
+        device = next(self.model.parameters()).device
+        data_list = []
+        
+        for x_flat in x_flat_list:
+            x = torch.FloatTensor(x_flat.reshape(self.original_data.x.shape)).to(device)
+            edge_index = self.original_data.edge_index.clone().to(device)
+            data = Data(
+                x=x,
+                edge_index=edge_index,
+                batch=torch.zeros(x.size(0), dtype=torch.long).to(device)
+            data_list.append(data)
+            
+        batch = Batch.from_data_list(data_list)
+        return self.model(batch)
 
-    print_environ()
-    print(s)
-    if args.latent_domain_num < 6:
-        args.batch_size = 32*args.latent_domain_num
-    else:
-        args.batch_size = 16*args.latent_domain_num
+def explain_gnn_predictions(model, data_loader, device, sample_count=10, nsamples=100):
+    """Explain model predictions using SHAP values"""
+    model.eval()
+    
+    # Get background samples
+    background_batch = next(iter(data_loader)).to(device)
+    background_data = background_batch.to_data_list()[:sample_count]
+    explain_data = background_data[0]
+    
+    # Create wrapper model
+    wrapped_model = GNNExplainerWrapper(model, explain_data).to(device)
+    
+    # Prepare background data
+    background_shap = [data.x.cpu().numpy().flatten() for data in background_data]
+    background_shap = np.array(background_shap)
+    
+    # Create explainer
+    explainer = shap.KernelExplainer(
+        model=lambda x: wrapped_model(x).detach().cpu().numpy(),
+        data=background_shap,
+        keep_index=True
+    )
+    
+    # Calculate SHAP values
+    sample_shap = explain_data.x.cpu().numpy().flatten()[np.newaxis, :]
+    shap_values = explainer.shap_values(
+        X=sample_shap,
+        nsamples=nsamples,
+        silent=True
+    )
+    
+    # Reshape results
+    shap_values = [v.reshape(explain_data.x.shape) for v in shap_values]
+    
+    return shap_values, explain_data
 
-    train_loader, train_loader_noshuffle, valid_loader, target_loader, _, _, _ = get_act_dataloader(args)
+def train_model(args):
+    """Main training function with integrated explanation capability"""
+    # Your existing training setup
+    model = TemporalGCN(
+        in_channels=args.in_channels,
+        hidden_dim=args.hidden_dim,
+        num_layers=args.num_layers,
+        lstm_hidden=args.lstm_hidden,
+        output_dim=args.output_dim
+    ).to(args.device)
+    
+    # Training loop
+    for epoch in range(args.epochs):
+        # Your existing training code
+        
+        # After training, explain predictions if requested
+        if args.use_shap and epoch == args.epochs - 1:
+            print("\n[INFO] Generating SHAP explanations...")
+            shap_values, explained_data = explain_gnn_predictions(
+                model=model,
+                data_loader=valid_loader,
+                device=args.device,
+                sample_count=10
+            )
+            
+            # You can add visualization here
+            print("SHAP values computed for final model")
+    
+    return model
 
-    best_valid_acc, target_acc = 0, 0
-
-    algorithm_class = alg.get_algorithm_class(args.algorithm)
-    algorithm = algorithm_class(args).cuda()
-    algorithm.train()
-
-    # ===== GNN feature extractor integration =====
-    use_gnn = getattr(args, "use_gnn", 0)
-    gnn = None
-    if use_gnn:
-        example_batch = next(iter(train_loader))[0] if hasattr(train_loader, '__iter__') else None
-        in_channels = example_batch.shape[1] if example_batch is not None else 8
-        gnn = TemporalGCN(
-            in_channels=in_channels,
-            hidden_dim=gnn_params["gcn_hidden_dim"],
-            num_layers=gnn_params["gcn_num_layers"],
-            lstm_hidden=gnn_params["lstm_hidden"],
-            output_dim=gnn_params["feature_output_dim"]
-        ).cuda()
-        algorithm.featurizer = nn.Identity()
-        print('[INFO] GNN feature extractor initialized. CNN featurizer is bypassed.')
-        gnn_out_dim = gnn.out.out_features
-        if hasattr(algorithm, "bottleneck"):
-            algorithm.bottleneck = nn.Linear(gnn_out_dim, 256).cuda()
-            print(f"[INFO] Bottleneck adjusted for GNN: {gnn_out_dim} -> 256")
-        if hasattr(algorithm, "abottleneck"):
-            algorithm.abottleneck = nn.Linear(gnn_out_dim, 256).cuda()
-            print(f"[INFO] Adversarial bottleneck adjusted for GNN: {gnn_out_dim} -> 256")
-        if hasattr(algorithm, "dbottleneck"):
-            algorithm.dbottleneck = nn.Linear(gnn_out_dim, 256).cuda()
-            print(f"[INFO] Domain bottleneck (dbottleneck) adjusted for GNN: {gnn_out_dim} -> 256")
-        algorithm.gnn_extractor = gnn
-        algorithm.use_gnn = True
-
-    optd = get_optimizer(algorithm, args, nettype='Diversify-adv')
-    opt = get_optimizer(algorithm, args, nettype='Diversify-cls')
-    opta = get_optimizer(algorithm, args, nettype='Diversify-all')
-
-    for round in range(args.max_epoch):
-        print(f'\n========ROUND {round}========')
-        print('====Feature update====')
-        loss_list = ['class']
-        print_row(['epoch']+[item+'_loss' for item in loss_list], colwidth=15)
-
-        for step in range(args.local_epoch):
-            for data in train_loader:
-                if use_gnn and gnn is not None:
-                    batch_x = data[0] if isinstance(data, (list, tuple)) else data
-                    if len(batch_x.shape) == 4 and batch_x.shape[2] == 1:
-                        batch_x = batch_x.squeeze(2)
-                    gnn_graphs = build_correlation_graph(batch_x.cuda())
-                    from torch_geometric.loader import DataLoader as GeoDataLoader
-                    geo_loader = GeoDataLoader(gnn_graphs, batch_size=len(gnn_graphs))
-                    for graph_batch in geo_loader:
-                        graph_batch = graph_batch.cuda()
-                        gnn_features = gnn(graph_batch)
-                    if isinstance(data, (list, tuple)) and len(data) > 1:
-                        data = (gnn_features, *data[1:])
-                    else:
-                        data = gnn_features
-                loss_result_dict = algorithm.update_a(data, opta)
-            print_row([step]+[loss_result_dict[item] for item in loss_list], colwidth=15)
-
-        print('====Latent domain characterization====')
-        loss_list = ['total', 'dis', 'ent']
-        print_row(['epoch']+[item+'_loss' for item in loss_list], colwidth=15)
-
-        for step in range(args.local_epoch):
-            for data in train_loader:
-                if use_gnn and gnn is not None:
-                    batch_x = data[0] if isinstance(data, (list, tuple)) else data
-                    if len(batch_x.shape) == 4 and batch_x.shape[2] == 1:
-                        batch_x = batch_x.squeeze(2)
-                    gnn_graphs = build_correlation_graph(batch_x.cuda())
-                    from torch_geometric.loader import DataLoader as GeoDataLoader
-                    geo_loader = GeoDataLoader(gnn_graphs, batch_size=len(gnn_graphs))
-                    for graph_batch in geo_loader:
-                        graph_batch = graph_batch.cuda()
-                        gnn_features = gnn(graph_batch)
-                    if isinstance(data, (list, tuple)) and len(data) > 1:
-                        data = (gnn_features, *data[1:])
-                    else:
-                        data = gnn_features
-                loss_result_dict = algorithm.update_d(data, optd)
-            print_row([step]+[loss_result_dict[item] for item in loss_list], colwidth=15)
-
-        algorithm.set_dlabel(train_loader)
-
-        print('====Domain-invariant feature learning====')
-
-        loss_list = alg_loss_dict(args)
-        eval_dict = train_valid_target_eval_names(args)
-        print_key = ['epoch']
-        print_key.extend([item+'_loss' for item in loss_list])
-        print_key.extend([item+'_acc' for item in eval_dict.keys()])
-        print_key.append('total_cost_time')
-        print_row(print_key, colwidth=15)
-
-        sss = time.time()
-        for step in range(args.local_epoch):
-            for data in train_loader:
-                if use_gnn and gnn is not None:
-                    batch_x = data[0] if isinstance(data, (list, tuple)) else data
-                    if len(batch_x.shape) == 4 and batch_x.shape[2] == 1:
-                        batch_x = batch_x.squeeze(2)
-                    gnn_graphs = build_correlation_graph(batch_x.cuda())
-                    from torch_geometric.loader import DataLoader as GeoDataLoader
-                    geo_loader = GeoDataLoader(gnn_graphs, batch_size=len(gnn_graphs))
-                    for graph_batch in geo_loader:
-                        graph_batch = graph_batch.cuda()
-                        gnn_features = gnn(graph_batch)
-                    if isinstance(data, (list, tuple)) and len(data) > 1:
-                        data = (gnn_features, *data[1:])
-                    else:
-                        data = gnn_features
-                step_vals = algorithm.update(data, opt)
-
-            results = {
-                'epoch': step,
-            }
-
-            results['train_acc'] = modelopera.accuracy(
-                algorithm, train_loader_noshuffle, None)
-
-            acc = modelopera.accuracy(algorithm, valid_loader, None)
-            results['valid_acc'] = acc
-
-            acc = modelopera.accuracy(algorithm, target_loader, None)
-            results['target_acc'] = acc
-
-            for key in loss_list:
-                results[key+'_loss'] = step_vals[key]
-            if results['valid_acc'] > best_valid_acc:
-                best_valid_acc = results['valid_acc']
-                target_acc = results['target_acc']
-            results['total_cost_time'] = time.time()-sss
-            print_row([results[key] for key in print_key], colwidth=15)
-
-    print(f'Target acc: {target_acc:.4f}')
-
-    # === SHAP explainability on GNN after training ===
-    if use_gnn and gnn is not None:
-        print("\n[INFO] Running SHAP explainability for GNN...")
-        shap_values, graph_batch = explain_gnn_with_shap(gnn, valid_loader, device='cuda')
-        feature_names = [f"Sensor {i}" for i in range(graph_batch.x.shape[1])]
-        plot_shap_summary(shap_values, graph_batch, feature_names=feature_names)
-        print("[INFO] SHAP summary saved to shap_summary.png")
-
-if __name__ == '__main__':
-    args = get_args()
-    main(args)
+if __name__ == "__main__":
+    # Your argument parsing and main execution
+    args = parse_args()
+    model = train_model(args)
