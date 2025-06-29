@@ -7,13 +7,17 @@ class GNNWrapper(torch.nn.Module):
         super().__init__()
         self.model = model
     def forward(self, batch):
-        # Unpack tuple if necessary (from SHAP)
         if isinstance(batch, (tuple, list)):
             batch = batch[0]
-        # Convert list of Data to Batch
         if isinstance(batch, list):
             batch = Batch.from_data_list(batch)
         return self.model(batch)
+
+def gnn_predict(batch_list):
+    # batch_list: list of arrays (from SHAP); need to convert to Batch objects
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    batch = Batch.from_data_list([torch_geometric.data.Data(x=torch.tensor(arr).float().to(device)) for arr in batch_list])
+    return wrapped_model(batch).detach().cpu().numpy()
 
 def explain_gnn_with_shap(gnn, data_loader, device, sample_count=10):
     gnn.eval()
@@ -23,8 +27,10 @@ def explain_gnn_with_shap(gnn, data_loader, device, sample_count=10):
     else:
         batch_data = batch
     batch_data = batch_data.to(device)
-    background = batch_data
     wrapped_model = GNNWrapper(gnn)
-    explainer = shap.GradientExplainer(wrapped_model, (background,))
-    shap_values = explainer.shap_values((batch_data,))
+    # Use only a few samples for KernelExplainer (as it's slow)
+    background = [d for d in batch_data.to_data_list()[:sample_count]]
+    explainer = shap.KernelExplainer(lambda arrs: wrapped_model(Batch.from_data_list([d.to(device) for d in arrs])).detach().cpu().numpy(),
+                                     background)
+    shap_values = explainer.shap_values([d for d in batch_data.to_data_list()])
     return shap_values, batch_data
