@@ -8,8 +8,8 @@ class GNNWrapper(torch.nn.Module):
     def forward(self, batch):
         return self.model(batch)
 
-def explain_gnn_with_shap(model, data_loader, device, sample_count=10):
-    model.eval()
+def explain_gnn_with_shap(gnn, data_loader, device, sample_count=10):
+    gnn.eval()
     batch = next(iter(data_loader))
     if isinstance(batch, (list, tuple)):
         batch_data = batch[0]
@@ -17,8 +17,7 @@ def explain_gnn_with_shap(model, data_loader, device, sample_count=10):
         batch_data = batch
     batch_data = batch_data.to(device)
     background = batch_data
-    wrapped_model = GNNWrapper(model)
-    # THIS IS THE KEY LINE: pass (background,) as tuple
+    wrapped_model = GNNWrapper(gnn)   # <--- use 'gnn' not 'model'
     explainer = shap.GradientExplainer(wrapped_model, (background,))
     shap_values = explainer.shap_values((batch_data,))
     return shap_values, batch_data
