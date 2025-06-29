@@ -1,14 +1,18 @@
 import shap
 import torch
+from torch_geometric.data import Batch
 
 class GNNWrapper(torch.nn.Module):
     def __init__(self, model):
         super().__init__()
         self.model = model
     def forward(self, batch):
-        # SHAP and PyTorch may pass tuple, list, or Batch
+        # Unpack tuple if necessary (from SHAP)
         if isinstance(batch, (tuple, list)):
             batch = batch[0]
+        # Convert list of Data to Batch
+        if isinstance(batch, list):
+            batch = Batch.from_data_list(batch)
         return self.model(batch)
 
 def explain_gnn_with_shap(gnn, data_loader, device, sample_count=10):
@@ -24,6 +28,3 @@ def explain_gnn_with_shap(gnn, data_loader, device, sample_count=10):
     explainer = shap.GradientExplainer(wrapped_model, (background,))
     shap_values = explainer.shap_values((batch_data,))
     return shap_values, batch_data
-
-def plot_shap_summary(shap_values, data, feature_names=None):
-    shap.summary_plot(shap_values, data.x.cpu().numpy(), feature_names=feature_names)
