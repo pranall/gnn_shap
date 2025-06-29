@@ -24,13 +24,13 @@ def explain_gnn_with_shap(gnn_model, data_loader, device, sample_count=5):
     gnn_model.eval()
     # Sample a batch from the loader
     batch = next(iter(data_loader))
-    if isinstance(batch, (list, tuple)):
-        batch = batch[0]
-    batch = batch.to(device)
-    # Use .to_data_list() for a list of Data objects
-    if hasattr(batch, "to_data_list"):
+    # Handle (data, label) tuple, or just data
+    if isinstance(batch, (list, tuple)) and hasattr(batch[0], 'to_data_list'):
+        data_list = batch[0].to_data_list()
+    elif hasattr(batch, 'to_data_list'):
         data_list = batch.to_data_list()
     else:
+        # Already a list of Data
         data_list = batch
     # Use a few graphs for background and explanation (KernelExplainer is slow)
     background = data_list[:sample_count]
@@ -38,18 +38,20 @@ def explain_gnn_with_shap(gnn_model, data_loader, device, sample_count=5):
 
     wrapped_model = GNNWrapper(gnn_model)
 
-    def gnn_predict(batch_list):
+    def gnn_predict(graph_list):
         # Accepts a list of Data objects, returns model output
-        batched = Batch.from_data_list(batch_list).to(device)
-        out = wrapped_model(batched)
+        from torch_geometric.data import Batch
+        batch = Batch.from_data_list(graph_list).to(device)
+        out = wrapped_model(batch)
         if isinstance(out, torch.Tensor):
             out = out.detach().cpu().numpy()
         return out
 
-    # KernelExplainer expects a callable and a list of background graphs
+    # KernelExplainer expects a callable and a list of Data objects
     explainer = shap.KernelExplainer(gnn_predict, background)
     shap_values = explainer.shap_values(test_samples)
     # For visualization, create a Batch for the test samples
+    from torch_geometric.data import Batch
     graph_batch = Batch.from_data_list(test_samples)
     return shap_values, graph_batch
 
