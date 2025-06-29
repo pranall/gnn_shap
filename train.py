@@ -1,11 +1,11 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch_geometric.nn import GCNConv, global_mean_pool, BatchNorm
 from torch_geometric.data import Data, Batch
+from torch_geometric.nn import GCNConv, global_mean_pool, BatchNorm
 import numpy as np
-from tqdm import tqdm
 import shap
+from tqdm import tqdm
 
 class TemporalGCN(nn.Module):
     def __init__(self, in_channels, hidden_dim, num_layers, lstm_hidden, output_dim, dropout=0.2):
@@ -36,12 +36,55 @@ class TemporalGCN(nn.Module):
         out = self.out(hn)
         return out
 
-def build_correlation_graph(batch_time_series, threshold=0.3, self_loops=True, max_edges_per_node=None):
-    """Improved graph builder with correlation-based edges"""
-    data_list = []
-    batch, channels, timesteps = batch_time_series.shape
+class GNNExplainerWrapper(nn.Module):
+    """Wrapper for SHAP explanations that preserves graph structure"""
+    def __init__(self, model, original_data_sample=None):
+        super().__init__()
+        self.model = model
+        self.original_data = original_data_sample
+        
+    def forward(self, inputs):
+        """Handle both direct GNN calls and SHAP explanations"""
+        if isinstance(inputs, (list, np.ndarray)):
+            # SHAP explanation case
+            return self._explain_forward(inputs)
+        # Normal GNN forward pass
+        return self.model(inputs)
+        
+    def _explain_forward(self, x_flat_list):
+        """Convert SHAP inputs to graph data"""
+        if self.original_data is None:
+            raise ValueError("Original data sample required for SHAP explanations")
+            
+        device = next(self.model.parameters()).device
+        data_list = []
+        
+        for x_flat in x_flat_list:
+            # Reshape flattened features to original dimensions
+            x = torch.FloatTensor(x_flat.reshape(self.original_data.x.shape)).to(device)
+            
+            # Create new Data object preserving original structure
+            data = Data(
+                x=x,
+                edge_index=self.original_data.edge_index.clone().to(device),
+                batch=torch.zeros(x.size(0), dtype=torch.long).to(device)
+            )
+            data_list.append(data)
+            
+        batch = Batch.from_data_list(data_list)
+        return self.model(batch)
 
-    for i in range(batch):
+def build_correlation_graph(batch_time_series, threshold=0.3, self_loops=True, max_edges_per_node=None, device='cpu'):
+    """
+    Improved graph builder:
+    - Uses absolute correlation (|r|)
+    - Can limit edges per node
+    - Optionally adds self-loops for GCN stability
+    """
+    data_list = []
+    batch_size, channels, timesteps = batch_time_series.shape
+
+    for i in range(batch_size):
         x = batch_time_series[i].T  # [timesteps, channels]
         x = x.float()
         corr = torch.corrcoef(x.T).abs()  # [channels, channels]
@@ -55,50 +98,36 @@ def build_correlation_graph(batch_time_series, threshold=0.3, self_loops=True, m
             topk_edges = []
             for node in range(channels):
                 node_corr = corr[node]
-                node_corr[node] = 0
+                node_corr[node] = 0  # Remove self correlation
                 topk = torch.topk(node_corr, k=min(max_edges_per_node, channels-1)).indices
                 for dst in topk:
                     topk_edges.append([node, dst.item()])
             if topk_edges:
-                edge_index = torch.tensor(topk_edges, dtype=torch.long).T
-                
+                edge_index = torch.tensor(topk_edges, dtype=torch.long).to(device)
+        
         node_features = x.mean(dim=0).unsqueeze(0)
         node_features = node_features.repeat(channels, 1)
-        data = Data(x=node_features, edge_index=edge_index)
+        data = Data(
+            x=node_features.to(device),
+            edge_index=edge_index.to(device),
+            batch=torch.zeros(channels, dtype=torch.long).to(device)
+        )
         data_list.append(data)
+    
     return data_list
 
-class GNNExplainerWrapper(nn.Module):
-    """Wrapper for SHAP explanations that preserves graph structure"""
-    def __init__(self, model, original_data_sample):
-        super().__init__()
-        self.model = model
-        self.original_data = original_data_sample
-        
-    def forward(self, x_flat_list):
-        device = next(self.model.parameters()).device
-        data_list = []
-        
-        for x_flat in x_flat_list:
-            x = torch.FloatTensor(x_flat.reshape(self.original_data.x.shape)).to(device)
-            edge_index = self.original_data.edge_index.clone().to(device)
-            data = Data(
-                x=x,
-                edge_index=edge_index,
-                batch=torch.zeros(x.size(0), dtype=torch.long).to(device)
-            data_list.append(data)
-            
-        batch = Batch.from_data_list(data_list)
-        return self.model(batch)
-
-def explain_gnn_predictions(model, data_loader, device, sample_count=10, nsamples=100):
+def explain_gnn_predictions(model, data_loader, device, sample_count=5, nsamples=50):
     """Explain model predictions using SHAP values"""
     model.eval()
     
     # Get background samples
-    background_batch = next(iter(data_loader)).to(device)
-    background_data = background_batch.to_data_list()[:sample_count]
-    explain_data = background_data[0]
+    try:
+        background_batch = next(iter(data_loader)).to(device)
+        background_data = background_batch.to_data_list()[:sample_count]
+        explain_data = background_data[0]
+    except Exception as e:
+        print(f"Error preparing data: {e}")
+        return None, None
     
     # Create wrapper model
     wrapped_model = GNNExplainerWrapper(model, explain_data).to(device)
@@ -109,27 +138,58 @@ def explain_gnn_predictions(model, data_loader, device, sample_count=10, nsample
     
     # Create explainer
     explainer = shap.KernelExplainer(
-        model=lambda x: wrapped_model(x).detach().cpu().numpy(),
+        model=wrapped_model,
         data=background_shap,
         keep_index=True
     )
     
     # Calculate SHAP values
-    sample_shap = explain_data.x.cpu().numpy().flatten()[np.newaxis, :]
-    shap_values = explainer.shap_values(
-        X=sample_shap,
-        nsamples=nsamples,
-        silent=True
-    )
-    
-    # Reshape results
-    shap_values = [v.reshape(explain_data.x.shape) for v in shap_values]
-    
-    return shap_values, explain_data
+    try:
+        sample_shap = explain_data.x.cpu().numpy().flatten()[np.newaxis, :]
+        shap_values = explainer.shap_values(sample_shap, nsamples=nsamples)
+        shap_values = shap_values[0].reshape(explain_data.x.shape)
+        return shap_values, explain_data
+    except Exception as e:
+        print(f"SHAP calculation failed: {e}")
+        return None, None
 
-def train_model(args):
-    """Main training function with integrated explanation capability"""
-    # Your existing training setup
+def train(args, model, train_loader, valid_loader):
+    """Main training function"""
+    optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
+    criterion = nn.CrossEntropyLoss()
+    
+    for epoch in range(args.max_epoch):
+        model.train()
+        total_loss = 0
+        
+        for batch in train_loader:
+            batch = batch.to(args.device)
+            optimizer.zero_grad()
+            outputs = model(batch)
+            loss = criterion(outputs, batch.y)
+            loss.backward()
+            optimizer.step()
+            total_loss += loss.item()
+        
+        print(f"Epoch {epoch+1}/{args.max_epoch}, Loss: {total_loss/len(train_loader):.4f}")
+        
+        # Run SHAP explanation if requested
+        if args.use_shap and epoch == args.max_epoch - 1:
+            print("\nGenerating SHAP explanations...")
+            shap_values, explained_data = explain_gnn_predictions(
+                model=model,
+                data_loader=valid_loader,
+                device=args.device,
+                sample_count=3,
+                nsamples=20
+            )
+            
+            if shap_values is not None:
+                print("SHAP values computed successfully")
+                # Add visualization here if needed
+
+def main(args):
+    # Initialize model
     model = TemporalGCN(
         in_channels=args.in_channels,
         hidden_dim=args.hidden_dim,
@@ -138,26 +198,17 @@ def train_model(args):
         output_dim=args.output_dim
     ).to(args.device)
     
-    # Training loop
-    for epoch in range(args.epochs):
-        # Your existing training code
-        
-        # After training, explain predictions if requested
-        if args.use_shap and epoch == args.epochs - 1:
-            print("\n[INFO] Generating SHAP explanations...")
-            shap_values, explained_data = explain_gnn_predictions(
-                model=model,
-                data_loader=valid_loader,
-                device=args.device,
-                sample_count=10
-            )
-            
-            # You can add visualization here
-            print("SHAP values computed for final model")
+    # Training
+    train(args, model, train_loader, valid_loader)
     
     return model
 
 if __name__ == "__main__":
-    # Your argument parsing and main execution
+    # Parse arguments (you'll need to implement this)
     args = parse_args()
-    model = train_model(args)
+    
+    # Create data loaders (you'll need to implement this)
+    train_loader, valid_loader = create_data_loaders(args)
+    
+    # Run training
+    model = main(args)
