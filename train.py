@@ -176,20 +176,56 @@ def visualize_shap_values(shap_vals, data):
     # TODO: your plotting/saving code here
     pass
 
+
 def explain_gnn_with_shap(model, valid_loader, device, sample_count=5, nsamples=50):
     model.eval()
+
+    # 1) grab one raw batch and turn it into a PyG Batch
     raw = next(iter(valid_loader))
     g   = batch_to_graph(raw, device)
+
+    # 2) get individual graphs & pick the first as our “anchor”
     data_list = g.to_data_list()
     anchor    = data_list[0]
 
+    # 3) wrap the model so SHAP can call it on flat arrays
     wrapper = GNNExplainerWrapper(model, anchor).to(device)
-    bg = np.stack([d.x.cpu().numpy().flatten() for d in data_list[:sample_count]], axis=0)
 
-    explainer = shap.KernelExplainer(wrapper, bg, keep_index=True)
-    tgt       = anchor.x.cpu().numpy().flatten()[None, :]
-    shap_vals = explainer.shap_values(tgt, nsamples=nsamples)
-    return shap_vals[0].reshape(anchor.x.shape), anchor
+    # 4) build the background matrix of flattened features
+    background = np.stack([
+        d.x.cpu().numpy().flatten()
+        for d in data_list[:sample_count]
+    ], axis=0)
+
+    # 5) instantiate SHAP with only the wrapper & background
+    explainer = shap.KernelExplainer(wrapper, background)
+
+    # 6) flatten the same anchor to get its SHAP values
+    target = anchor.x.cpu().numpy().flatten()[None, :]
+
+    # 7) get SHAP values (this might return a list *or* a single big array)
+    shap_out = explainer.shap_values(target, nsamples=nsamples)
+
+    # 8) Determine which class we care about (we’ll pick the model’s top prediction)
+    with torch.no_grad():
+        pred = model(Batch.from_data_list([anchor]).to(device)).argmax(dim=1).item()
+
+    # 9) Extract & reshape the correct slice
+    if isinstance(shap_out, list):
+        # shap_out[class] is shape (1, num_features)
+        flat_shap = shap_out[pred][0]
+    else:
+        # shap_out is an array of shape (1, num_features * num_classes)
+        flat_arr = shap_out[0]
+        M = anchor.x.numel()              # num_features (e.g. 64)
+        K = flat_arr.size // M            # num_classes (e.g. 6)
+        reshaped = flat_arr.reshape(K, M) # [num_classes, num_features]
+        flat_shap = reshaped[pred]        # pick the row for our class
+
+    # 10) finally, restore the (nodes, features) layout
+    shap_vals = flat_shap.reshape(anchor.x.shape)
+    return shap_vals, anchor
+
 
 def validate(args, model, valid_loader, epoch):
     model.eval()
