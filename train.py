@@ -13,6 +13,42 @@ import torch.nn as nn
 from models.gnn_extractor import TemporalGCN, build_correlation_graph
 from diversify.utils.params import gnn_params
 
+# === SHAP imports ===
+import shap
+import numpy as np
+import matplotlib.pyplot as plt
+
+def explain_gnn_with_shap(gnn_model, data_loader, device, sample_count=10):
+    gnn_model.eval()
+    # Sample a batch from the loader
+    batch = next(iter(data_loader))
+    batch_x = batch[0] if isinstance(batch, (list, tuple)) else batch
+    if len(batch_x.shape) == 4 and batch_x.shape[2] == 1:
+        batch_x = batch_x.squeeze(2)
+    batch_x = batch_x[:sample_count]
+    gnn_graphs = build_correlation_graph(batch_x.to(device))
+    from torch_geometric.loader import DataLoader as GeoDataLoader
+    geo_loader = GeoDataLoader(gnn_graphs, batch_size=len(gnn_graphs))
+    graph_batch = next(iter(geo_loader)).to(device)
+
+    def gnn_forward(graphs):
+        return gnn_model(graphs).detach().cpu().numpy()
+    
+    # SHAP expects background samples: use a small batch as background
+    background = [graph_batch[i] for i in range(min(5, len(graph_batch)))]
+    explainer = shap.DeepExplainer(gnn_model, background)
+    shap_values = explainer.shap_values(graph_batch)
+    return shap_values, graph_batch
+
+def plot_shap_summary(shap_values, graph_batch, feature_names=None):
+    # Node features: graph_batch.x
+    # Each row = node, columns = features (sensors)
+    x_np = graph_batch.x.cpu().numpy()
+    shap.summary_plot(shap_values, x_np, feature_names=feature_names, show=False)
+    plt.tight_layout()
+    plt.savefig("shap_summary.png")
+    plt.show()
+
 def main(args):
     s = print_args(args, [])
     set_random_seed(args.seed)
@@ -36,7 +72,6 @@ def main(args):
     use_gnn = getattr(args, "use_gnn", 0)
     gnn = None
     if use_gnn:
-        # Assumes data shape is [batch, channels, timesteps]
         example_batch = next(iter(train_loader))[0] if hasattr(train_loader, '__iter__') else None
         in_channels = example_batch.shape[1] if example_batch is not None else 8
         gnn = TemporalGCN(
@@ -46,10 +81,8 @@ def main(args):
             lstm_hidden=gnn_params["lstm_hidden"],
             output_dim=gnn_params["feature_output_dim"]
         ).cuda()
-        # >>>>> KEY CHANGE: Overwrite featurizer with identity for GNN <<<<<
         algorithm.featurizer = nn.Identity()
         print('[INFO] GNN feature extractor initialized. CNN featurizer is bypassed.')
-        # >>>>> NEW: Patch bottleneck(s) for GNN feature size <<<<<
         gnn_out_dim = gnn.out.out_features
         if hasattr(algorithm, "bottleneck"):
             algorithm.bottleneck = nn.Linear(gnn_out_dim, 256).cuda()
@@ -60,7 +93,6 @@ def main(args):
         if hasattr(algorithm, "dbottleneck"):
             algorithm.dbottleneck = nn.Linear(gnn_out_dim, 256).cuda()
             print(f"[INFO] Domain bottleneck (dbottleneck) adjusted for GNN: {gnn_out_dim} -> 256")
-        # === NEW for GNN in set_dlabel (do NOT remove these lines) ===
         algorithm.gnn_extractor = gnn
         algorithm.use_gnn = True
 
@@ -76,7 +108,6 @@ def main(args):
 
         for step in range(args.local_epoch):
             for data in train_loader:
-                # === GNN: extract features if enabled ===
                 if use_gnn and gnn is not None:
                     batch_x = data[0] if isinstance(data, (list, tuple)) else data
                     if len(batch_x.shape) == 4 and batch_x.shape[2] == 1:
@@ -87,13 +118,10 @@ def main(args):
                     for graph_batch in geo_loader:
                         graph_batch = graph_batch.cuda()
                         gnn_features = gnn(graph_batch)
-                    # >>>>> Only pass GNN features and label(s) forward <<<<<
                     if isinstance(data, (list, tuple)) and len(data) > 1:
                         data = (gnn_features, *data[1:])
                     else:
                         data = gnn_features
-                # === END GNN block ===
-
                 loss_result_dict = algorithm.update_a(data, opta)
             print_row([step]+[loss_result_dict[item] for item in loss_list], colwidth=15)
 
@@ -103,7 +131,6 @@ def main(args):
 
         for step in range(args.local_epoch):
             for data in train_loader:
-                # === GNN: extract features if enabled ===
                 if use_gnn and gnn is not None:
                     batch_x = data[0] if isinstance(data, (list, tuple)) else data
                     if len(batch_x.shape) == 4 and batch_x.shape[2] == 1:
@@ -118,8 +145,6 @@ def main(args):
                         data = (gnn_features, *data[1:])
                     else:
                         data = gnn_features
-                # === END GNN block ===
-
                 loss_result_dict = algorithm.update_d(data, optd)
             print_row([step]+[loss_result_dict[item] for item in loss_list], colwidth=15)
 
@@ -138,7 +163,6 @@ def main(args):
         sss = time.time()
         for step in range(args.local_epoch):
             for data in train_loader:
-                # === GNN: extract features if enabled ===
                 if use_gnn and gnn is not None:
                     batch_x = data[0] if isinstance(data, (list, tuple)) else data
                     if len(batch_x.shape) == 4 and batch_x.shape[2] == 1:
@@ -153,8 +177,6 @@ def main(args):
                         data = (gnn_features, *data[1:])
                     else:
                         data = gnn_features
-                # === END GNN block ===
-
                 step_vals = algorithm.update(data, opt)
 
             results = {
@@ -180,6 +202,13 @@ def main(args):
 
     print(f'Target acc: {target_acc:.4f}')
 
+    # === SHAP explainability on GNN after training ===
+    if use_gnn and gnn is not None:
+        print("\n[INFO] Running SHAP explainability for GNN...")
+        shap_values, graph_batch = explain_gnn_with_shap(gnn, valid_loader, device='cuda')
+        feature_names = [f"Sensor {i}" for i in range(graph_batch.x.shape[1])]
+        plot_shap_summary(shap_values, graph_batch, feature_names=feature_names)
+        print("[INFO] SHAP summary saved to shap_summary.png")
 
 if __name__ == '__main__':
     args = get_args()
