@@ -63,6 +63,8 @@ def parse_args():
                         help="Random seed")
     parser.add_argument('--N_WORKERS',         type=int,   default=2,
                         help="DataLoader workers")
+    parser.add_argument('--steps_per_epoch',   type=int,   default=int(1e9),
+                        help="Cap on steps-per-epoch for Diversify loader")
 
     # SHAP flags
     parser.add_argument('--use_shap',          type=int, choices=[0,1], default=1,
