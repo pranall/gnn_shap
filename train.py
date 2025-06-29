@@ -116,52 +116,52 @@ def build_correlation_graph(batch_time_series, threshold=0.3, self_loops=True, m
     
     return data_list
 
-def explain_gnn_predictions(model, data_loader, device, sample_count=5, nsamples=50):
-    """Explain model predictions using SHAP values"""
+def validate(args, model, valid_loader, epoch):
     model.eval()
+    total_loss = 0
+    correct = 0
+    total = 0
     
-    # Get background samples
-    try:
-        background_batch = next(iter(data_loader)).to(device)
-        background_data = background_batch.to_data_list()[:sample_count]
-        explain_data = background_data[0]
-    except Exception as e:
-        print(f"Error preparing data: {e}")
-        return None, None
+    criterion = nn.CrossEntropyLoss()
     
-    # Create wrapper model
-    wrapped_model = GNNExplainerWrapper(model, explain_data).to(device)
+    with torch.no_grad():
+        for batch in valid_loader:
+            batch = batch.to(args.device)
+            outputs = model(batch)
+            loss = criterion(outputs, batch.y)
+            total_loss += loss.item()
+            
+            _, predicted = torch.max(outputs.data, 1)
+            total += batch.y.size(0)
+            correct += (predicted == batch.y).sum().item()
     
-    # Prepare background data
-    background_shap = [data.x.cpu().numpy().flatten() for data in background_data]
-    background_shap = np.array(background_shap)
+    accuracy = 100 * correct / total
+    print(f'Validation Accuracy: {accuracy:.2f}%, Loss: {total_loss/len(valid_loader):.4f}')
     
-    # Create explainer
-    explainer = shap.KernelExplainer(
-        model=wrapped_model,
-        data=background_shap,
-        keep_index=True
-    )
+    # Run SHAP explanation during validation
+    if args.use_shap and epoch % args.shap_freq == 0:
+        print("\n[SHAP] Generating explanations...")
+        shap_values, explained_data = explain_gnn_with_shap(
+            model,
+            valid_loader,
+            device=args.device
+        )
+        
+        if shap_values is not None:
+            print("SHAP values computed successfully")
+            # Add visualization/saving here
+            visualize_shap_values(shap_values, explained_data)
     
-    # Calculate SHAP values
-    try:
-        sample_shap = explain_data.x.cpu().numpy().flatten()[np.newaxis, :]
-        shap_values = explainer.shap_values(sample_shap, nsamples=nsamples)
-        shap_values = shap_values[0].reshape(explain_data.x.shape)
-        return shap_values, explain_data
-    except Exception as e:
-        print(f"SHAP calculation failed: {e}")
-        return None, None
+    return accuracy
 
 def train(args, model, train_loader, valid_loader):
-    """Main training function"""
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
     criterion = nn.CrossEntropyLoss()
     
+    best_acc = 0
     for epoch in range(args.max_epoch):
         model.train()
-        total_loss = 0
-        
+        train_loss = 0
         for batch in train_loader:
             batch = batch.to(args.device)
             optimizer.zero_grad()
@@ -169,24 +169,17 @@ def train(args, model, train_loader, valid_loader):
             loss = criterion(outputs, batch.y)
             loss.backward()
             optimizer.step()
-            total_loss += loss.item()
+            train_loss += loss.item()
         
-        print(f"Epoch {epoch+1}/{args.max_epoch}, Loss: {total_loss/len(train_loader):.4f}")
+        print(f"Epoch {epoch+1}/{args.max_epoch}, Loss: {train_loss/len(train_loader):.4f}")
         
-        # Run SHAP explanation if requested
-        if args.use_shap and epoch == args.max_epoch - 1:
-            print("\nGenerating SHAP explanations...")
-            shap_values, explained_data = explain_gnn_predictions(
-                model=model,
-                data_loader=valid_loader,
-                device=args.device,
-                sample_count=3,
-                nsamples=20
-            )
-            
-            if shap_values is not None:
-                print("SHAP values computed successfully")
-                # Add visualization here if needed
+        # Validation phase with SHAP
+        val_acc = validate(args, model, valid_loader, epoch)
+        
+        # Save best model
+        if val_acc > best_acc:
+            best_acc = val_acc
+            torch.save(model.state_dict(), 'best_model.pth')
 
 def main(args):
     # Initialize model
