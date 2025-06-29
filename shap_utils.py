@@ -6,8 +6,8 @@ class GNNWrapper(torch.nn.Module):
         super().__init__()
         self.model = model
     def forward(self, batch):
-        # Patch: accept tuple from SHAP
-        if isinstance(batch, tuple):
+        # SHAP and PyTorch may pass tuple, list, or Batch
+        if isinstance(batch, (tuple, list)):
             batch = batch[0]
         return self.model(batch)
 
