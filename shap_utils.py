@@ -3,22 +3,22 @@ import torch
 
 def explain_gnn_with_shap(model, data_loader, device, sample_count=10):
     model.eval()
-    # Select a batch for explanation
-    batch_data, batch_labels = next(iter(data_loader))
+    # Get a batch for explanation
+    batch = next(iter(data_loader))
+    if isinstance(batch, (list, tuple)):
+        batch_data = batch[0]
+    else:
+        batch_data = batch
     batch_data = batch_data.to(device)
     
-    # DeepExplainer expects a callable; wrap your model
-    def gnn_forward(input_data):
-        # input_data: batch of graph objects on CPU, so move to device
-        return model(input_data.to(device), input_data.batch.to(device)).detach().cpu().numpy()
+    # For graph data, background can be a small batch (not a list of single samples)
+    background = batch_data[:min(sample_count, batch_data.shape[0])]
     
-    # SHAP expects background samples; sample from data_loader
-    background = [batch_data[i] for i in range(min(sample_count, len(batch_data)))]
-    
-    explainer = shap.DeepExplainer(gnn_forward, background)
+    # GradientExplainer works better with custom PyTorch models (like GNNs)
+    explainer = shap.GradientExplainer(model, background)
     shap_values = explainer.shap_values(batch_data)
-    return shap_values, batch_data, batch_labels
+    return shap_values, batch_data
 
 def plot_shap_summary(shap_values, data, feature_names=None):
-    # Summarize feature attributions (works for tabular-like or node-level)
+    # For torch_geometric Data object: data.x is node feature matrix
     shap.summary_plot(shap_values, data.x.cpu().numpy(), feature_names=feature_names)
