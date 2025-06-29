@@ -1,0 +1,10 @@
+torch>=1.13.1
+torchvision
+scipy
+numpy==1.23.5
+torch>=1.10.0
+torch-geometric
+numpy
+scikit-learn
+tqdm
+matplotlib
