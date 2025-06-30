@@ -296,3 +296,4 @@ def main():
     train(args, model, train_loader, valid_loader)
 
 if __name__ == '__main__':
+  main()
