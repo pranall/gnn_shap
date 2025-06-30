@@ -32,7 +32,7 @@ def parse_args():
     parser.add_argument('--test_envs',   type=int, nargs='+', default=[0])
     parser.add_argument('--algorithm',   type=str, default='diversify')
     parser.add_argument('--use_gnn',     type=int, choices=[0,1], default=1)
-    parser.add_argument('--enable_shap', action='store_true')
+    parser.add_argument('--enable_shap', action='store_true',help='Run SHAP explainability')
     parser.add_argument('--task',        type=str, default='cross_people')
     parser.add_argument('--latent_domain_num', type=int, default=5)
     parser.add_argument('--alpha1',      type=float, default=1.0)
